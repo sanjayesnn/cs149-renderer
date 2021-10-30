@@ -14,6 +14,22 @@
 
 #define THREADS_PER_BLOCK 256
 
+#define DEBUG
+
+#ifdef DEBUG
+#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n", 
+        cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
 
 // helper function to round an integer up to the next power of 2
 static inline int nextPow2(int n) {
@@ -25,6 +41,27 @@ static inline int nextPow2(int n) {
     n |= n >> 16;
     n++;
     return n;
+}
+
+__global__ void
+upsweep_kernel(int* arr, int two_d) {
+    int index = (blockIdx.x * blockDim.x + threadIdx.x) * two_d * 2;
+
+    arr[index + two_d * 2 - 1] += arr[index + two_d - 1];
+}
+
+__global__ void
+downsweep_kernel(int* arr, int two_d) {
+    int index = (blockIdx.x * blockDim.x + threadIdx.x) * two_d * 2;
+
+    int t = arr[index + two_d - 1];
+    arr[index+two_d-1] = arr[index+two_d*2-1];
+    arr[index+two_d*2-1] += t;
+}
+
+__global__ void
+change_elem(int* result, int N) {
+    result[N-1] = 0;
 }
 
 // exclusive_scan --
@@ -54,7 +91,30 @@ void exclusive_scan(int* input, int N, int* result)
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
 
+ 
+    // upsweep phase
+    int rounded_N = nextPow2(N);
+    for (int two_d = 1; two_d <= rounded_N/2; two_d*=2) {
+        int two_dplus1 = 2*two_d;
+        const int num_iterations = rounded_N / two_dplus1;
+        const int num_blocks = (num_iterations + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        const int num_threads = num_blocks == 1 ? num_iterations : THREADS_PER_BLOCK;
+        upsweep_kernel<<<num_blocks, num_threads>>>(result, two_d);
+    }
+    change_elem<<<1,1>>>(result, rounded_N);
+  
 
+
+    // downsweep phase
+    for (int two_d = rounded_N/2; two_d >= 1; two_d /= 2) {
+        int two_dplus1 = 2*two_d;
+        const int num_iterations = (rounded_N + two_dplus1 - 1) / two_dplus1;
+        const int num_blocks = (num_iterations + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        const int num_threads = num_blocks == 1 ? num_iterations : THREADS_PER_BLOCK;
+        downsweep_kernel<<<num_blocks, num_threads>>>(result, two_d);
+    }
+
+    cudaDeviceSynchronize();
 }
 
 
@@ -140,6 +200,28 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration; 
 }
 
+__global__ void
+check_adjacent_values_kernel(int* input, int* output, int length) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (index < length) {
+        output[index] = input[index] == input[index + 1] ? 1 : 0;
+    }
+}
+
+__global__ void
+get_adjacent_indices_kernel(int* input, int* output, int length) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (index < length && input[index] != input[index + 1]) {
+        output[input[index]] = index;
+    }
+}
+
+__global__ void
+get_size_kernel(int* size, int* input, int length) {
+    *size = input[length-1];
+}
 
 // find_repeats --
 //
@@ -160,8 +242,24 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
+    
+    const int blocks = (length + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
-    return 0; 
+    check_adjacent_values_kernel<<<blocks, THREADS_PER_BLOCK>>>(device_input, device_output, length);
+
+    exclusive_scan(device_output, length, device_input);
+
+    get_adjacent_indices_kernel<<<blocks, THREADS_PER_BLOCK>>>(device_input, device_output, length);
+ 
+    int size;
+    cudaMemcpy(&size, device_output + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
+    // cudaMalloc(&size, sizeof(int));
+    // get_size_kernel<<<1, 1>>>(size, device_input, length);
+
+    // return *size; 
+    // printf("WAHOO\n");
+    // return device_input[length - 1];
+    return size;
 }
 
 
