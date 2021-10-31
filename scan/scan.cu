@@ -60,7 +60,7 @@ downsweep_kernel(int* arr, int two_d) {
 }
 
 __global__ void
-change_elem(int* result, int N) {
+zero_last_elem_kernel(int* result, int N) {
     result[N-1] = 0;
 }
 
@@ -101,7 +101,7 @@ void exclusive_scan(int* input, int N, int* result)
         const int num_threads = num_blocks == 1 ? num_iterations : THREADS_PER_BLOCK;
         upsweep_kernel<<<num_blocks, num_threads>>>(result, two_d);
     }
-    change_elem<<<1,1>>>(result, rounded_N);
+    zero_last_elem_kernel<<<1,1>>>(result, rounded_N);
   
 
 
@@ -244,21 +244,13 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // the actual array length.
     
     const int blocks = (length + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-
     check_adjacent_values_kernel<<<blocks, THREADS_PER_BLOCK>>>(device_input, device_output, length);
-
-    exclusive_scan(device_output, length, device_input);
-
+    exclusive_scan(device_input, length, device_output);
+    cudaMemcpy(device_input, device_output, length * sizeof(int), cudaMemcpyDeviceToDevice);
     get_adjacent_indices_kernel<<<blocks, THREADS_PER_BLOCK>>>(device_input, device_output, length);
  
     int size;
     cudaMemcpy(&size, device_output + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
-    // cudaMalloc(&size, sizeof(int));
-    // get_size_kernel<<<1, 1>>>(size, device_input, length);
-
-    // return *size; 
-    // printf("WAHOO\n");
-    // return device_input[length - 1];
     return size;
 }
 
