@@ -27,7 +27,7 @@ private:
     float* cudaDeviceRadius;
     float* cudaDeviceImageData;
 
-	void flattenContributors(bool *pixels);
+	void flattenContributors(int *pixels);
 
 public:
 

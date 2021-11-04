@@ -620,15 +620,19 @@ CudaRenderer::clearImage() {
 // from the given values assuming that every set of n values constitutes a new subarray
 // where indecies should start over.
 __global__ void
-scan_cleanup(int n, bool *input, bool *output) {
+scan_cleanup(int n, int len, int *input, int *output) {
 	// I think a 1d calculation should be fine for this problem
 	int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-	// Fix one pixel off edge case
-	if (index % n != n - 1 && input[index] != input[index + 1]) {
-		int sub_array = index / n;
-		int real_index = input[index] - input[sub_array * n];
+	int sub_array = index / n;
+	int real_index = input[index] - input[sub_array * n];
+	
+	if ((index == len - 1 && output[n-1] == 1) || input[index] != input[index + 1]) {
 		output[(sub_array * n) + real_index] = index % n;
+	}
+	
+	if (index % n == n - 1 && real_index != n - 1) {
+		output[(sub_array * n) + real_index + 1] = -1;
 	}
 }
 
@@ -637,19 +641,20 @@ scan_cleanup(int n, bool *input, bool *output) {
 // Take arrays of circles contributing to pixels and return a version where the indecies of
 // all circles are in the front of array, followed by a -1.
 void
-CudaRenderer::flattenContributors(bool *pixels) {
+CudaRenderer::flattenContributors(int *pixels) {
 	size_t array_size = image->width * image->height * numCircles;
 
+	// Setup second array for results
+	int *temp = nullptr;
+	cudaMalloc(&temp, array_size * sizeof(int));
+	
 	// Exclusive scan across all pixel subarrays done in place through thrust
-	thrust::exclusive_scan(thrust::host, pixels, pixels + array_size, pixels);
+	thrust::exclusive_scan(thrust::host, pixels, pixels + array_size, temp);
 
 	const int threads_per_block = numCircles > THREADS_PER_BLOCK ? THREADS_PER_BLOCK : numCircles;
 	const int blocks = (array_size + threads_per_block - 1) / threads_per_block;
 
-	bool *output = nullptr;
-	cudaMalloc(&output, array_size * sizeof(bool));
-
-	scan_cleanup<<<blocks, threads_per_block>>>(numCircles, pixels, output);
+	scan_cleanup<<<blocks, threads_per_block>>>(numCircles, array_size, temp, pixels);
 }
 
 // advanceAnimation --
