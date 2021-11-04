@@ -204,7 +204,7 @@ __global__ void
 check_adjacent_values_kernel(int* input, int* output, int length) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     
-    if (index < length) {
+    if (index < length-1) {
         output[index] = input[index] == input[index + 1] ? 1 : 0;
     }
 }
@@ -213,7 +213,7 @@ __global__ void
 get_adjacent_indices_kernel(int* input, int* output, int length) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     
-    if (index < length && input[index] != input[index + 1]) {
+    if (index < length-1 && input[index] != input[index + 1]) {
         output[input[index]] = index;
     }
 }
