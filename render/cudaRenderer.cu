@@ -383,6 +383,37 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // END SHOULD-BE-ATOMIC REGION
 }
 
+__global__ void
+applyPixelColor(int *pixels) {
+	int index = (blockIdx.x * blockDim.x + threadIdx.x);
+
+	short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+	if (index >= imageWidth * imageHeight)
+		return;
+
+	int pixelY = index / imageWidth;
+	int pixelX = index % imageWidth;
+	float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+
+	float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+	float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+										 invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+	int n = cuConstRendererParams.numCircles;
+	// Index is now start of array for that pixel
+	index *= n;
+	while (pixels[index] != -1) {
+		int index3 = 3 * pixels[index];
+		float3 pos = *(float3*)(&cuConstRendererParams.position[index3]);
+		
+		shadePixel(index, pixelCenterNorm, pos, imgPtr);
+		if (index++ % n == n - 1)
+			return;
+	}
+}
+
 // kernelRenderCircles -- (CUDA device code)
 //
 // Each thread renders a circle.  Since there is no protection to
@@ -624,6 +655,9 @@ scan_cleanup(int n, int len, int *input, int *output) {
 	// I think a 1d calculation should be fine for this problem
 	int index = blockIdx.x * blockDim.x + threadIdx.x;
 
+	if (index >= len)
+		return;
+	
 	int sub_array = index / n;
 	int real_index = input[index] - input[sub_array * n];
 	
