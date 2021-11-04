@@ -17,6 +17,23 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#define DEBUG
+
+#ifdef DEBUG
+#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n", 
+        cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -392,8 +409,8 @@ applyPixelColor(int *pixels) {
 	if (index >= imageWidth * imageHeight)
 		return;
 
-	int pixelY = index / imageWidth;
-	int pixelX = index % imageWidth;
+	int pixelY = index % imageWidth;
+	int pixelX = index / imageWidth;
 	float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
 
 	float invWidth = 1.f / imageWidth;
@@ -676,19 +693,26 @@ scan_cleanup(int n, int len, int *input, int *output) {
 // all circles are in the front of array, followed by a -1.
 void
 CudaRenderer::flattenContributors(int *pixels) {
-	size_t array_size = image->width * image->height * numCircles;
+	int array_size = image->width * image->height * numCircles;
 
 	// Setup second array for results
 	int *temp = nullptr;
 	cudaMalloc(&temp, array_size * sizeof(int));
 	
 	// Exclusive scan across all pixel subarrays done in place through thrust
-	thrust::exclusive_scan(thrust::host, pixels, pixels + array_size, temp);
+    printf("Exclusive scan\n");
+    printf("Array size: %d\n", array_size);
+	thrust::exclusive_scan(thrust::device, pixels, pixels + array_size, temp, 0);
+    // int data[6] = {1, 0, 2, 2, 1, 3};
+    // thrust::exclusive_scan(thrust::host, data, data + 6, data, 4); // in-place scan
 
 	const int threads_per_block = numCircles > THREADS_PER_BLOCK ? THREADS_PER_BLOCK : numCircles;
 	const int blocks = (array_size + threads_per_block - 1) / threads_per_block;
 
+    printf("Scan cleanup\n");
 	scan_cleanup<<<blocks, threads_per_block>>>(numCircles, array_size, temp, pixels);
+    cudaCheckError(cudaDeviceSynchronize());
+    cudaFree(temp);
 }
 
 // advanceAnimation --
@@ -714,6 +738,93 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
+__device__ void
+compute_clamp(int* x, int max) {
+    if (*x < 0) {
+        *x = 0;
+    }
+    else if (*x > max) {
+        *x = max;
+    }
+}
+
+__global__ void
+compute_circle_membership_kernel(int* circle_membership_per_pixel) {
+
+	int circleIndex = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (circleIndex >= cuConstRendererParams.numCircles) {
+        return;
+    }
+
+    // circle_membership_per_pixel[circleIndex] = circleIndex;
+    // return;
+
+    int index3 = 3 * circleIndex;
+
+    float px = cuConstRendererParams.position[index3];
+    float py = cuConstRendererParams.position[index3+1];
+    //float pz = cuConstRendererParams.position[index3+2];
+    float rad = cuConstRendererParams.radius[circleIndex];
+
+    // compute the bounding box of the circle.  This bounding box
+    // is in normalized coordinates
+    float minX = px - rad;
+    float maxX = px + rad;
+    float minY = py - rad;
+    float maxY = py + rad;
+
+    // convert normalized coordinate bounds to integer screen
+    // pixel bounds.  Clamp to the edges of the screen.
+    //CLAMP(x, minimum, maximum) std::max(minimum, std::min(x, maximum))
+
+    int screenMinX = static_cast<int>(minX * cuConstRendererParams.imageWidth);
+    int screenMaxX = static_cast<int>(maxX * cuConstRendererParams.imageWidth);
+    int screenMinY = static_cast<int>(minX * cuConstRendererParams.imageHeight);
+    int screenMaxY = static_cast<int>(minX * cuConstRendererParams.imageHeight);
+
+    compute_clamp(&screenMinX, cuConstRendererParams.imageWidth);
+    compute_clamp(&screenMaxX, cuConstRendererParams.imageWidth);
+    compute_clamp(&screenMinY, cuConstRendererParams.imageHeight);
+    compute_clamp(&screenMaxY, cuConstRendererParams.imageHeight);
+
+    // int screenMinX = CLAMP(static_cast<int>(minX * cuConstRendererParams.imageWidth), 0, cuConstRendererParams.imageWidth);
+    // if ()
+    // int screenMaxX = CLAMP(static_cast<int>(maxX * cuConstRendererParams.imageWidth)+1, 0, cuConstRendererParams.imageWidth);
+    // int screenMinY = CLAMP(static_cast<int>(minY * cuConstRendererParams.imageHeight), 0, cuConstRendererParams.imageHeight);
+    // int screenMaxY = CLAMP(static_cast<int>(maxY * cuConstRendererParams.imageHeight)+1, 0, cuConstRendererParams.imageHeight);
+
+    float invWidth = 1.f / cuConstRendererParams.imageWidth;
+    float invHeight = 1.f / cuConstRendererParams.imageHeight;
+
+    // for each pixel in the bounding box, determine the circle's
+    // contribution to the pixel.  The contribution is computed in
+    // the function shadePixel.  Since the circle does not fill
+    // the bounding box entirely, not every pixel in the box will
+    // receive contribution.
+    for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
+
+        // pointer to pixel data
+        float* imgPtr = &cuConstRendererParams.imageData[4 * (pixelY * cuConstRendererParams.imageWidth + screenMinX)];
+
+        for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
+
+            // When "shading" the pixel ("shading" = computing the
+            // circle's color and opacity at the pixel), we treat
+            // the pixel as a point at the center of the pixel.
+            // We'll compute the color of the circle at this
+            // point.  Note that shading math will occur in the
+            // normalized [0,1]^2 coordinate space, so we convert
+            // the pixel center into this coordinate space prior
+            // to calling shadePixel.
+            int arrIndex = pixelX * cuConstRendererParams.imageWidth * cuConstRendererParams.numCircles + pixelY * cuConstRendererParams.numCircles;
+            circle_membership_per_pixel[arrIndex + circleIndex] = 1;
+            imgPtr += 4;
+        }
+    }
+
+}
+
 void
 CudaRenderer::render() {
 
@@ -721,6 +832,35 @@ CudaRenderer::render() {
     dim3 blockDim(256, 1);
     dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
+    //kernelRenderCircles<<<gridDim, blockDim>>>();
+    //cudaDeviceSynchronize();
+
+    int width = image->width;
+    int height = image->height;
+    printf("Image width: %d, image height: %d, num circles: %d\n", width, height, numCircles);
+    int* circle_membership_per_pixel;
+    cudaMalloc((void **)&circle_membership_per_pixel, sizeof(int) * numCircles * width * height);
+    cudaMemset(circle_membership_per_pixel, 0, numCircles * width * height*sizeof(int));
+
+    // int* tmp = (int *)malloc(sizeof(int) * numCircles * width * height);
+    // cudaMemcpy(tmp, circle_membership_per_pixel, sizeof(int) * numCircles * width * height, cudaMemcpyDeviceToHost);
+    // printf("tmp[0]: %d, tmp[1]: %d, tmp[2]: %d\n", tmp[0], tmp[1], tmp[2]);
+
+    const int threads_per_block = 512;
+    int num_blocks = (numCircles + threads_per_block - 1) / threads_per_block;
+    printf("Compute circle membership kernel\n");
+    compute_circle_membership_kernel<<<num_blocks, threads_per_block>>>(circle_membership_per_pixel);
+    
+    cudaCheckError(cudaDeviceSynchronize());
+    //cudaMemcpy(tmp, circle_membership_per_pixel, sizeof(int) * numCircles * width * height, cudaMemcpyDeviceToHost);
+    //printf("tmp[0]: %d, tmp[1]: %d, tmp[2]: %d\n", tmp[0], tmp[1], tmp[2]);
+    printf("Flatten contributors\n");
+    flattenContributors(circle_membership_per_pixel);
+
+    num_blocks = (width * height + threads_per_block - 1) / threads_per_block;
+    printf("Apply pixel color\n");
+    applyPixelColor<<<num_blocks, threads_per_block>>>(circle_membership_per_pixel);
+    cudaCheckError(cudaDeviceSynchronize());
+
+    cudaFree(circle_membership_per_pixel);
 }
