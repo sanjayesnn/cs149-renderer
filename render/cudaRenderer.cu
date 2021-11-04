@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <vector>
 
+#include <thrust/scan.h>
+#include <thrust/execution_policy.h>
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <driver_functions.h>
@@ -50,6 +53,7 @@ __constant__ float  cuConstNoise1DValueTable[256];
 #define COLOR_MAP_SIZE 5
 __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 
+const int THREADS_PER_BLOCK = 1024;
 
 // including parts of the CUDA code from external files to keep this
 // file simpler and to seperate code that should not be modified
@@ -608,6 +612,44 @@ CudaRenderer::clearImage() {
         kernelClearImage<<<gridDim, blockDim>>>(1.f, 1.f, 1.f, 1.f);
     }
     cudaDeviceSynchronize();
+}
+
+// scanCleanup --
+//
+// Take a binary array that has been processed by excusive scan and derives indexes
+// from the given values assuming that every set of n values constitutes a new subarray
+// where indecies should start over.
+__global__ void
+scan_cleanup(int n, bool *input, bool *output) {
+	// I think a 1d calculation should be fine for this problem
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+	// Fix one pixel off edge case
+	if (index % n != n - 1 && input[index] != input[index + 1]) {
+		int sub_array = index / n;
+		int real_index = input[index] - input[sub_array * n];
+		output[(sub_array * n) + real_index] = index % n;
+	}
+}
+
+// flattenContributors --
+//
+// Take arrays of circles contributing to pixels and return a version where the indecies of
+// all circles are in the front of array, followed by a -1.
+void
+CudaRenderer::flattenContributors(bool *pixels) {
+	size_t array_size = image->width * image->height * numCircles;
+
+	// Exclusive scan across all pixel subarrays done in place through thrust
+	thrust::exclusive_scan(thrust::host, pixels, pixels + array_size, pixels);
+
+	const int threads_per_block = numCircles > THREADS_PER_BLOCK ? THREADS_PER_BLOCK : numCircles;
+	const int blocks = (array_size + threads_per_block - 1) / threads_per_block;
+
+	bool *output = nullptr;
+	cudaMalloc(&output, array_size * sizeof(bool));
+
+	scan_cleanup<<<blocks, threads_per_block>>>(numCircles, pixels, output);
 }
 
 // advanceAnimation --
