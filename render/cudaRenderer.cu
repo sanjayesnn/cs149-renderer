@@ -68,14 +68,18 @@ __constant__ float  cuConstNoise1DValueTable[256];
 
 // color ramp table needed for the color ramp lookup shader
 #define COLOR_MAP_SIZE 5
+#define SCAN_BLOCK_DIM   256
 __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 
 const int THREADS_PER_BLOCK = 1024;
 
 // including parts of the CUDA code from external files to keep this
 // file simpler and to seperate code that should not be modified
+#include "circleBoxTest.cu_inl"
+#include "exclusiveScan.cu_inl"
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
+
 
 
 // kernelClearImageSnowflake -- (CUDA device code)
@@ -437,28 +441,60 @@ applyPixelColor(int *pixels) {
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
 __global__ void kernelRenderCircles() {
-
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
     int xCoord = blockIdx.x * blockDim.x + threadIdx.x;
     int yCoord = blockIdx.y * blockDim.y + threadIdx.y;
 
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
+    int linearThreadIndex =  threadIdx.y * blockDim.x + threadIdx.x;
+    // TODO: Make global constants later.
+    const int BLOCKSIZE = 256;
+    __shared__ uint prefixSumInput[BLOCKSIZE];
+    __shared__ uint prefixSumOutput[BLOCKSIZE];
+    __shared__ uint prefixSumScratch[2 * BLOCKSIZE];
+    __shared__ int intersectingCircleIndices[BLOCKSIZE];
 
-    if (xCoord >= imageWidth || yCoord >= imageHeight) {
-        return;
-    }
+    float boxL = (float)blockIdx.x * blockDim.x / imageWidth;
+    float boxR = ((float)blockIdx.x * blockDim.x + blockDim.x - 1) / imageWidth;
+    float boxT = ((float)blockIdx.y * blockDim.y + blockDim.y - 1) /imageHeight;
+    float boxB = (float)blockIdx.y * blockDim.y / imageHeight;
 
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (yCoord * imageWidth + xCoord)]);
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(xCoord) + 0.5f),
                                                  invHeight * (static_cast<float>(yCoord) + 0.5f));
+   
+    for (int i = 0; i < cuConstRendererParams.numCircles; i += BLOCKSIZE) {
+        int circleIndex = i + linearThreadIndex;
+        if (circleIndex < cuConstRendererParams.numCircles) {
+            float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIndex]);
+            prefixSumInput[linearThreadIndex] = circleInBoxConservative(
+                                    p.x, p.y, cuConstRendererParams.radius[circleIndex],
+                                    boxL, boxR, boxT, boxB);
+        }
+        else {
+            prefixSumInput[linearThreadIndex] = 0;
+        }
+        sharedMemExclusiveScan(linearThreadIndex, prefixSumInput, prefixSumOutput, prefixSumScratch, BLOCKSIZE);
+        // Not sure if necessary
+        __syncthreads();
 
-    for (int circleIndex=0; circleIndex<cuConstRendererParams.numCircles; circleIndex++) {
-        int index3 = 3 * circleIndex;
-        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        shadePixel(circleIndex, pixelCenterNorm, p, imgPtr);
+        if (linearThreadIndex == BLOCKSIZE - 1 && prefixSumInput[linearThreadIndex] == 1) {
+            intersectingCircleIndices[prefixSumOutput[linearThreadIndex]] = linearThreadIndex + i;
+        }
+        else if (prefixSumInput[linearThreadIndex] == 1) {
+            intersectingCircleIndices[prefixSumOutput[linearThreadIndex]] = linearThreadIndex + i;
+        }
+        // Not sure if necessary
+        __syncthreads();
+
+        if (xCoord < imageWidth && yCoord < imageHeight) {
+            for (int j = 0; j < prefixSumInput[BLOCKSIZE - 1] + prefixSumOutput[BLOCKSIZE - 1]; j++) {
+                float3 p = *(float3*)(&cuConstRendererParams.position[intersectingCircleIndices[j] * 3]);
+                shadePixel(intersectingCircleIndices[j], pixelCenterNorm, p, imgPtr);
+            }
+        }
     }
 }
 
