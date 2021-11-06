@@ -68,7 +68,7 @@ __constant__ float  cuConstNoise1DValueTable[256];
 
 // color ramp table needed for the color ramp lookup shader
 #define COLOR_MAP_SIZE 5
-#define SCAN_BLOCK_DIM   1024
+#define SCAN_BLOCK_DIM   256
 __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 
 const int THREADS_PER_BLOCK = 1024;
@@ -398,7 +398,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
     newColor.w = alpha + existingColor.w;
 
-    // global memory write
+    // THIS IS LOCAL, NOT GLOBAL FOR PERFORMANCE.
     *imagePtr = newColor;
 
     // END SHOULD-BE-ATOMIC REGION
@@ -445,63 +445,66 @@ __global__ void kernelRenderCircles() {
     short imageHeight = cuConstRendererParams.imageHeight;
     int xCoord = blockIdx.x * blockDim.x + threadIdx.x;
     int yCoord = blockIdx.y * blockDim.y + threadIdx.y;
+    bool coordsInBounds = xCoord < imageWidth && yCoord < imageHeight;
 
     int linearThreadIndex =  threadIdx.y * blockDim.x + threadIdx.x;
     // TODO: Make global constants later.
     // SHARED MEMORY SIZE IN BYTES: 49152
     // This means thrust is not useful with this strategy bc we have no bound on # of circles
     // Have to do batch processing anyway https://piazza.com/class/kts8r2wwk6p5gs?cid=624
-    const int BLOCKSIZE = 1024;
+    const int BLOCKSIZE = 256;
     __shared__ uint prefixSumInput[BLOCKSIZE];
     __shared__ uint prefixSumOutput[BLOCKSIZE];
     __shared__ uint prefixSumScratch[2 * BLOCKSIZE];
     __shared__ int intersectingCircleIndices[BLOCKSIZE];
 
-    // Doesn't fully make sense to me: https://piazza.com/class/kts8r2wwk6p5gs?cid=640
-    float boxL = (float)blockIdx.x * blockDim.x / imageWidth;
-    // The plus 5 is for correctness, but it's not optimal - what's the correct tight bound?
-    float boxR = ((float)blockIdx.x * blockDim.x + blockDim.x + 5) / imageWidth;
-    // The plus 5 is for correctness, but it's not optimal - what's the correct tight bound?
-    float boxT = ((float)blockIdx.y * blockDim.y + blockDim.y + 5) /imageHeight;
-    float boxB = (float)blockIdx.y * blockDim.y / imageHeight;
-
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
+    // Doesn't fully make sense to me: https://piazza.com/class/kts8r2wwk6p5gs?cid=640
+    float boxL = blockIdx.x * blockDim.x * invWidth;
+    // In theory should be (blockIdx.x * blockDim.x + blockDim.x - 1) / imageWidth but no dice.
+    float boxR = (blockIdx.x * blockDim.x + blockDim.x) * invWidth;
+    float boxT = (blockIdx.y * blockDim.y + blockDim.y) * invHeight;
+    float boxB = blockIdx.y * blockDim.y * invHeight;
+
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (yCoord * imageWidth + xCoord)]);
+    // Use local variable and do 1 global write at the end for performance. 
+    float4 localImg = *imgPtr;
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(xCoord) + 0.5f),
                                                  invHeight * (static_cast<float>(yCoord) + 0.5f));
    
     for (int i = 0; i < cuConstRendererParams.numCircles; i += BLOCKSIZE) {
         int circleIndex = i + linearThreadIndex;
+        prefixSumInput[linearThreadIndex] = 0;
         if (circleIndex < cuConstRendererParams.numCircles) {
             float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIndex]);
+            // From OH: staff solution uses circleInBox, not circleInBoxConservative
             prefixSumInput[linearThreadIndex] = circleInBox(
                                     p.x, p.y, cuConstRendererParams.radius[circleIndex],
                                     boxL, boxR, boxT, boxB);
         }
-        else {
-            prefixSumInput[linearThreadIndex] = 0;
-        }
+
         sharedMemExclusiveScan(linearThreadIndex, prefixSumInput, prefixSumOutput, prefixSumScratch, BLOCKSIZE);
         // Not sure if necessary
         __syncthreads();
 
-        if (linearThreadIndex == BLOCKSIZE - 1 && prefixSumInput[linearThreadIndex] == 1) {
-            intersectingCircleIndices[prefixSumOutput[linearThreadIndex]] = linearThreadIndex + i;
-        }
-        else if (prefixSumInput[linearThreadIndex] == 1) {
+        if (prefixSumInput[linearThreadIndex] == 1) {
             intersectingCircleIndices[prefixSumOutput[linearThreadIndex]] = linearThreadIndex + i;
         }
         // Not sure if necessary
         __syncthreads();
 
-        if (xCoord < imageWidth && yCoord < imageHeight) {
-            for (int j = 0; j < prefixSumInput[BLOCKSIZE - 1] + prefixSumOutput[BLOCKSIZE - 1]; j++) {
+        if (coordsInBounds) {
+            int numIterations = prefixSumInput[BLOCKSIZE - 1] + prefixSumOutput[BLOCKSIZE - 1];
+            for (int j = 0; j < numIterations; j++) {
                 float3 p = *(float3*)(&cuConstRendererParams.position[intersectingCircleIndices[j] * 3]);
-                shadePixel(intersectingCircleIndices[j], pixelCenterNorm, p, imgPtr);
+                shadePixel(intersectingCircleIndices[j], pixelCenterNorm, p, &localImg);
             }
         }
     }
+
+    // GLOBAL WRITE
+    *imgPtr = localImg;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -854,7 +857,8 @@ void
 CudaRenderer::render() {
 
     // 256 threads per block is a healthy number
-    dim3 blockDim(32, 32);
+    // From OH: staff solution uses 16x16
+    dim3 blockDim(16, 16);
     dim3 gridDim((image->width + blockDim.x - 1) / blockDim.x, (image->height + blockDim.y - 1) / blockDim.y);
 
     kernelRenderCircles<<<gridDim, blockDim>>>();
